@@ -629,7 +629,7 @@
   },
   "source": {
     "marketplaceId": "irodori.elasticsearch",
-    "repository": "https://github.com/hjosugi/irodori-extension-elasticsearch",
+    "repository": "https://github.com/irodori-table/irodori-extension-elasticsearch",
     "knowledgeEngineStatus": "recognized_no_connector",
     "adapter": null,
     "adapterSha256": null,
