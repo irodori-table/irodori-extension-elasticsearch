@@ -24,6 +24,10 @@ struct SearchConfig {
     password: Option<String>,
     api_key: Option<String>,
     bearer_token: Option<String>,
+    /// The shared secret a JWT realm may require alongside the token, sent as
+    /// `ES-Client-Authentication`. Separate from the JWT itself because the
+    /// realm can be configured with or without one.
+    jwt_shared_secret: Option<String>,
     tls: TlsConfig,
     redaction_values: Vec<String>,
 }
@@ -203,7 +207,16 @@ impl SearchConnection {
         if let Some(api_key) = self.config.api_key.as_deref() {
             builder.header("Authorization", format!("ApiKey {api_key}"))
         } else if let Some(token) = self.config.bearer_token.as_deref() {
-            builder.bearer_auth(token)
+            let builder = builder.bearer_auth(token);
+            // A JWT realm configured with a client-authentication secret
+            // rejects the token without this header, with an error that does
+            // not mention the secret.
+            match self.config.jwt_shared_secret.as_deref() {
+                Some(secret) => {
+                    builder.header("ES-Client-Authentication", format!("SharedSecret {secret}"))
+                }
+                None => builder,
+            }
         } else if let Some(username) = self.config.username.as_deref() {
             builder.basic_auth(username, self.config.password.as_deref())
         } else {
@@ -322,7 +335,29 @@ impl SearchConfig {
         let username = option_string(request, &["user", "username"]);
         let password = option_string(request, &["password"]);
         let api_key = option_string(request, &["apiKey", "api_key"]);
-        let bearer_token = option_string(request, &["token", "bearerToken", "accessToken"]);
+        // A JWT and an OAuth2 access token both travel as a bearer token — the
+        // difference is where they come from, not how they are sent. Accepting
+        // their own option names means a profile can say which it is holding
+        // rather than having to know they share a transport.
+        let bearer_token = option_string(
+            request,
+            &[
+                "token",
+                "bearerToken",
+                "accessToken",
+                "jwt",
+                "jwtToken",
+                "oauth2AccessToken",
+            ],
+        );
+        let jwt_shared_secret = option_string(
+            request,
+            &[
+                "jwtSharedSecret",
+                "clientAuthenticationSharedSecret",
+                "sharedSecret",
+            ],
+        );
         let tls = TlsConfig::from_request(request);
         let mut redaction_values = Vec::new();
         push_sensitive(&mut redaction_values, password.as_deref());
@@ -335,6 +370,7 @@ impl SearchConfig {
             password,
             api_key,
             bearer_token,
+            jwt_shared_secret,
             tls,
             redaction_values,
         })
@@ -853,5 +889,50 @@ mod tests {
         assert!(err.contains("contains no PEM certificate"), "{err}");
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_jwt_is_accepted_under_its_own_option_name() {
+        // A JWT and an OAuth2 access token share the bearer transport, but a
+        // profile should be able to say which it holds.
+        for field in ["jwt", "jwtToken", "oauth2AccessToken", "bearerToken"] {
+            let config = SearchConfig::from_request(&json!({
+                "profile": { "host": "search.local", "options": { field: "tok-value" } }
+            }))
+            .unwrap();
+            assert_eq!(config.bearer_token.as_deref(), Some("tok-value"), "{field}");
+        }
+    }
+
+    #[test]
+    fn the_jwt_realm_shared_secret_is_read_separately() {
+        // The realm can be configured with or without one, so it is not part of
+        // the token.
+        let config = SearchConfig::from_request(&json!({
+            "profile": {
+                "host": "search.local",
+                "options": { "jwt": "tok", "jwtSharedSecret": "shh" }
+            }
+        }))
+        .unwrap();
+        assert_eq!(config.jwt_shared_secret.as_deref(), Some("shh"));
+
+        let without = SearchConfig::from_request(&json!({
+            "profile": { "host": "search.local", "options": { "jwt": "tok" } }
+        }))
+        .unwrap();
+        assert_eq!(without.jwt_shared_secret, None);
+    }
+
+    #[test]
+    fn an_api_key_still_wins_over_a_bearer_token() {
+        // Precedence is unchanged: Elasticsearch treats an API key as the more
+        // specific instruction.
+        let config = SearchConfig::from_request(&json!({
+            "profile": { "host": "search.local", "options": { "apiKey": "k", "jwt": "t" } }
+        }))
+        .unwrap();
+        assert_eq!(config.api_key.as_deref(), Some("k"));
+        assert_eq!(config.bearer_token.as_deref(), Some("t"));
     }
 }
