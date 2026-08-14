@@ -94,10 +94,11 @@ pub fn call_json(request: IrodoriConnectorBuffer) -> IrodoriConnectorBuffer {
 
 fn connect(request: &Value) -> IrodoriConnectorBuffer {
     let connection_id = abi::connection_id(Some(request));
-    let config = match SearchConfig::from_request(request) {
-        Ok(config) => config,
-        Err(err) => return abi::error("connector.invalidRequest", err),
-    };
+    let config =
+        match runtime().and_then(|runtime| runtime.block_on(SearchConfig::from_request(request))) {
+            Ok(config) => config,
+            Err(err) => return abi::error("connector.invalidRequest", err),
+        };
     let client = match config.tls.build_client() {
         Ok(client) => client,
         Err(err) => return abi::error("connector.invalidRequest", config.redact(&err)),
@@ -328,8 +329,117 @@ fn read_pem(path: &str, label: &str) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|err| format!("{label} at {path} could not be read: {err}"))
 }
 
+/// The identity provider a profile wants a token from.
+///
+/// Nothing is inferred: an endpoint, a client id, and a client secret are all
+/// required together, because guessing any of them would send credentials
+/// somewhere the user did not name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OAuth2ClientCredentials {
+    token_endpoint: String,
+    client_id: String,
+    client_secret: String,
+    scope: Option<String>,
+}
+
+impl OAuth2ClientCredentials {
+    /// `None` when the profile asks for no grant; `Err` when it asks for one
+    /// and leaves out a part, which is worth saying rather than silently
+    /// falling back to unauthenticated.
+    fn from_request(request: &Value) -> Result<Option<Self>, String> {
+        let token_endpoint = option_string(
+            request,
+            &[
+                "oauth2TokenEndpoint",
+                "oauth2ServerUri",
+                "tokenEndpoint",
+                "oauthServerUri",
+            ],
+        );
+        let client_id = option_string(request, &["oauth2ClientId", "oauthClientId"]);
+        let client_secret = option_string(request, &["oauth2ClientSecret", "oauthClientSecret"]);
+        let scope = option_string(request, &["oauth2Scope", "scope"]);
+
+        match (token_endpoint, client_id, client_secret) {
+            (None, None, None) => Ok(None),
+            (Some(token_endpoint), Some(client_id), Some(client_secret)) => Ok(Some(Self {
+                token_endpoint,
+                client_id,
+                client_secret,
+                scope,
+            })),
+            (token_endpoint, client_id, client_secret) => {
+                let mut missing = Vec::new();
+                if token_endpoint.is_none() {
+                    missing.push("oauth2TokenEndpoint");
+                }
+                if client_id.is_none() {
+                    missing.push("oauth2ClientId");
+                }
+                if client_secret.is_none() {
+                    missing.push("oauth2ClientSecret");
+                }
+                Err(format!("OAuth2 needs {} as well.", missing.join(", ")))
+            }
+        }
+    }
+
+    /// Perform the grant and return the access token.
+    async fn fetch_token(&self, client: &Client) -> Result<String, String> {
+        let mut body = format!(
+            "grant_type=client_credentials&client_id={}&client_secret={}",
+            form_encode(&self.client_id),
+            form_encode(&self.client_secret)
+        );
+        if let Some(scope) = &self.scope {
+            body.push_str(&format!("&scope={}", form_encode(scope)));
+        }
+        let response = client
+            .post(&self.token_endpoint)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body)
+            .send()
+            .await
+            .map_err(|err| format!("OAuth2 token request failed: {err}"))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|err| format!("OAuth2 token response read failed: {err}"))?;
+        if !status.is_success() {
+            // The body of a failed token request routinely echoes the client id
+            // and sometimes the secret, and this string reaches logs.
+            return Err(format!(
+                "the identity provider returned HTTP {status} for the OAuth2 token request."
+            ));
+        }
+        serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("access_token")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| "the OAuth2 token response contained no access_token.".to_string())
+    }
+}
+
+fn form_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 impl SearchConfig {
-    fn from_request(request: &Value) -> Result<Self, String> {
+    async fn from_request(request: &Value) -> Result<Self, String> {
         let base_url = option_string(request, &["connectionString", "url", "dsn"])
             .unwrap_or_else(|| build_url(request));
         let username = option_string(request, &["user", "username"]);
@@ -359,6 +469,12 @@ impl SearchConfig {
             ],
         );
         let tls = TlsConfig::from_request(request);
+        // A grant the profile asks for is performed here, so the rest of the
+        // driver only ever sees a bearer token.
+        let bearer_token = match OAuth2ClientCredentials::from_request(request)? {
+            Some(credentials) => Some(credentials.fetch_token(&Client::new()).await?),
+            None => bearer_token,
+        };
         let mut redaction_values = Vec::new();
         push_sensitive(&mut redaction_values, password.as_deref());
         push_sensitive(&mut redaction_values, api_key.as_deref());
@@ -797,7 +913,7 @@ mod tests {
     #[test]
     fn builds_url_from_profile() {
         let request = json!({"profile": {"host": "search.local", "port": 9443, "tls": true}});
-        let config = SearchConfig::from_request(&request).unwrap();
+        let config = block_on_config(&request).unwrap();
         assert_eq!(config.base_url, "https://search.local:9443");
     }
 
@@ -896,7 +1012,7 @@ mod tests {
         // A JWT and an OAuth2 access token share the bearer transport, but a
         // profile should be able to say which it holds.
         for field in ["jwt", "jwtToken", "oauth2AccessToken", "bearerToken"] {
-            let config = SearchConfig::from_request(&json!({
+            let config = block_on_config(&json!({
                 "profile": { "host": "search.local", "options": { field: "tok-value" } }
             }))
             .unwrap();
@@ -908,7 +1024,7 @@ mod tests {
     fn the_jwt_realm_shared_secret_is_read_separately() {
         // The realm can be configured with or without one, so it is not part of
         // the token.
-        let config = SearchConfig::from_request(&json!({
+        let config = block_on_config(&json!({
             "profile": {
                 "host": "search.local",
                 "options": { "jwt": "tok", "jwtSharedSecret": "shh" }
@@ -917,7 +1033,7 @@ mod tests {
         .unwrap();
         assert_eq!(config.jwt_shared_secret.as_deref(), Some("shh"));
 
-        let without = SearchConfig::from_request(&json!({
+        let without = block_on_config(&json!({
             "profile": { "host": "search.local", "options": { "jwt": "tok" } }
         }))
         .unwrap();
@@ -928,11 +1044,74 @@ mod tests {
     fn an_api_key_still_wins_over_a_bearer_token() {
         // Precedence is unchanged: Elasticsearch treats an API key as the more
         // specific instruction.
-        let config = SearchConfig::from_request(&json!({
+        let config = block_on_config(&json!({
             "profile": { "host": "search.local", "options": { "apiKey": "k", "jwt": "t" } }
         }))
         .unwrap();
         assert_eq!(config.api_key.as_deref(), Some("k"));
         assert_eq!(config.bearer_token.as_deref(), Some("t"));
+    }
+
+    /// The config builder can perform an OAuth2 grant, so it is async; these
+    /// tests only exercise paths that do not reach the network.
+    fn block_on_config(request: &Value) -> Result<SearchConfig, String> {
+        runtime()
+            .expect("runtime")
+            .block_on(SearchConfig::from_request(request))
+    }
+
+    #[test]
+    fn a_profile_asking_for_no_grant_gets_none() {
+        assert_eq!(
+            OAuth2ClientCredentials::from_request(&json!({ "profile": {} })).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_complete_grant_is_recognised_under_both_spellings() {
+        for (endpoint_field, id_field, secret_field) in [
+            (
+                "oauth2TokenEndpoint",
+                "oauth2ClientId",
+                "oauth2ClientSecret",
+            ),
+            ("oauth2ServerUri", "oauthClientId", "oauthClientSecret"),
+        ] {
+            let credentials = OAuth2ClientCredentials::from_request(&json!({
+                "profile": { "options": {
+                    endpoint_field: "https://idp.example/token",
+                    id_field: "client",
+                    secret_field: "shh",
+                    "scope": "search"
+                } }
+            }))
+            .unwrap()
+            .expect("credentials");
+            assert_eq!(credentials.token_endpoint, "https://idp.example/token");
+            assert_eq!(credentials.client_id, "client");
+            assert_eq!(credentials.scope.as_deref(), Some("search"));
+        }
+    }
+
+    #[test]
+    fn a_partial_grant_names_what_is_missing() {
+        // Falling back to unauthenticated because one field was mistyped is the
+        // failure mode worth avoiding here.
+        let err = OAuth2ClientCredentials::from_request(&json!({
+            "profile": { "options": { "oauth2ClientId": "client" } }
+        }))
+        .unwrap_err();
+        assert!(err.contains("oauth2TokenEndpoint"), "{err}");
+        assert!(err.contains("oauth2ClientSecret"), "{err}");
+        assert!(!err.contains("oauth2ClientId"), "{err}");
+    }
+
+    #[test]
+    fn grant_bodies_are_form_encoded() {
+        // A client secret containing `&` must not be able to introduce another
+        // parameter.
+        assert_eq!(form_encode("a&b=c"), "a%26b%3Dc");
+        assert_eq!(form_encode("plain-Secret_1.0~"), "plain-Secret_1.0~");
     }
 }
